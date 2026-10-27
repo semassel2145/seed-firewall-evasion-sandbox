@@ -1,0 +1,82 @@
+---
+# SEED Labs - Firewall Evasion Lab (Bypassing Firewalls using VPN)
+# CyberRangeCZ Topology Definition
+#
+# Mapping of the SEED lab setup to the sandbox:
+#   SEED "VPN Client (VM1)"  ->  vpn-client      (client-net, user accessible)
+#   SEED "VPN Server (VM2)"  ->  vpn-server      (server-net)
+#   SEED "Internet"          ->  router + target-net (blocked-target = the site the firewall blocks)
+#
+# Addressing notes (CyberRangeCZ/OpenStack address restriction):
+#   - .1 is reserved for the gateway and .2 for DHCP in every network, so no
+#     mapping uses .1 or .2. Routers use .10 and hosts use .11.
+#   - 192.168.53.0/24 is deliberately NOT used here: it is the lab's tun0 range.
+#   - All three CIDRs are disjoint and must not overlap your platform's
+#     management network CIDR (adjust if they do).
+name: seed-firewall-evasion-vpn
+
+hosts:
+  - name: vpn-client
+    base_box:
+      image: ubuntu-noble-x86_64
+      mgmt_user: ubuntu
+    flavor: csirtmu.small2x4
+
+  - name: vpn-server
+    base_box:
+      image: ubuntu-noble-x86_64
+      mgmt_user: ubuntu
+    flavor: csirtmu.small2x4
+    hidden: false
+
+  - name: blocked-target
+    base_box:
+      image: ubuntu-noble-x86_64
+      mgmt_user: ubuntu
+    flavor: csirtmu.tiny1x2
+
+routers:
+  - name: inet-router
+    base_box:
+      image: ubuntu-noble-x86_64
+      mgmt_user: ubuntu
+    flavor: csirtmu.tiny1x2
+
+networks:
+  - name: client-net
+    cidr: 10.10.1.0/24
+    accessible_by_user: true
+
+  - name: server-net
+    cidr: 10.10.2.0/24
+    accessible_by_user: false
+
+  - name: target-net
+    cidr: 10.10.3.0/24
+    accessible_by_user: false
+
+net_mappings:
+  - host: vpn-client
+    network: client-net
+    ip: 10.10.1.11
+
+  - host: vpn-server
+    network: server-net
+    ip: 10.10.2.11
+
+  - host: blocked-target
+    network: target-net
+    ip: 10.10.3.11
+
+router_mappings:
+  - router: inet-router
+    network: client-net
+    ip: 10.10.1.10
+
+  - router: inet-router
+    network: server-net
+    ip: 10.10.2.10
+
+  - router: inet-router
+    network: target-net
+    ip: 10.10.3.10

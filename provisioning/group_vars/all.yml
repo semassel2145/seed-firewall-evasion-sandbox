@@ -1,0 +1,10 @@
+---
+# Values shared by all plays. They must match topology.yml.
+
+# Host the egress firewall on vpn-client blocks (SEED Task 2).
+blocked_target_ip: 10.10.3.11
+
+# VPN binaries (SEED Task 3). The tunnel itself is started by the student.
+vpn_binary_dir: /opt/seed-vpn
+vpn_binary_mode: "0755"
+vpn_udp_port: 9090      # port used by the SEED sample vpnserver (UDP)

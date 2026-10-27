@@ -1,0 +1,228 @@
+---
+# SEED Labs - Firewall Evasion Lab provisioning for CyberRangeCZ.
+# Host names below are the node names from topology.yml.
+#
+# Automated here:
+#   Task 1  - machines, networks, packages, binaries
+#   Task 2  - UFW egress firewall on vpn-client blocking blocked_target_ip
+#   Task 3  - server prerequisites only (ip_forward + NAT masquerade).
+#             Starting the tunnel, tun0 addresses and routes are left to the student.
+
+# ---------------------------------------------------------------- vpn-client
+- name: Configure VPN client with egress firewall (SEED Task 2)
+  hosts: vpn-client
+  become: true
+  tasks:
+    - name: Install firewall, networking and capture tools
+      ansible.builtin.apt:
+        name:
+          - ufw
+          - iproute2
+          - net-tools
+          - tcpdump
+          - curl
+          - netcat-openbsd
+        state: present
+        update_cache: true
+
+    - name: Load the tun kernel module (may be built in; /dev/net/tun is checked below)
+      ansible.builtin.command: modprobe tun
+      changed_when: false
+      failed_when: false
+
+    - name: Check that /dev/net/tun exists
+      ansible.builtin.stat:
+        path: /dev/net/tun
+      register: tun_dev
+
+    - name: Fail early if TUN is unavailable
+      ansible.builtin.assert:
+        that: tun_dev.stat.exists
+        fail_msg: "/dev/net/tun is missing; the VPN cannot work on this image."
+
+    - name: Find the real interface used to reach the blocked target
+      ansible.builtin.shell: |
+        set -o pipefail
+        ip -o route get {{ blocked_target_ip }} | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1
+      args:
+        executable: /bin/bash
+      register: egress_iface
+      changed_when: false
+
+    - name: Fail if the egress interface could not be detected
+      ansible.builtin.assert:
+        that: egress_iface.stdout | length > 0
+        fail_msg: "Could not determine the interface used to reach {{ blocked_target_ip }}."
+
+    # Without this, enabling UFW (default deny incoming) would cut the
+    # management SSH connection that Ansible and the platform use.
+    - name: Allow inbound SSH before enabling UFW
+      ansible.builtin.command: ufw allow in 22/tcp
+      register: ufw_ssh
+      changed_when: "'Skipping' not in ufw_ssh.stdout"
+
+    # Mirrors the lab: sudo ufw deny out on <iface> to <ip>
+    # The rule is on the REAL interface only, so traffic to tun0 is not affected.
+    - name: Deny outbound traffic to the target on the real interface
+      ansible.builtin.command: >-
+        ufw deny out on {{ egress_iface.stdout }} to {{ blocked_target_ip }}
+      register: ufw_deny
+      changed_when: "'Skipping' not in ufw_deny.stdout"
+
+    - name: Enable UFW
+      ansible.builtin.command: ufw --force enable
+      register: ufw_enable
+      changed_when: "'already' not in ufw_enable.stdout | lower"
+
+    - name: Create VPN binary directory
+      ansible.builtin.file:
+        path: "{{ vpn_binary_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy vpnclient binary
+      ansible.builtin.copy:
+        src: files/vpnclient
+        dest: "{{ vpn_binary_dir }}/vpnclient"
+        owner: root
+        group: root
+        mode: "{{ vpn_binary_mode }}"
+
+    - name: Record firewall status for verification
+      ansible.builtin.command: ufw status verbose
+      register: ufw_status
+      changed_when: false
+
+    - name: Show firewall status
+      ansible.builtin.debug:
+        var: ufw_status.stdout_lines
+
+# ---------------------------------------------------------------- vpn-server
+- name: Configure VPN server as gateway with NAT (SEED Task 3 prerequisites)
+  hosts: vpn-server
+  become: true
+  tasks:
+    - name: Install networking and capture tools
+      ansible.builtin.apt:
+        name:
+          - iptables
+          - iproute2
+          - net-tools
+          - tcpdump
+          - curl
+          - netcat-openbsd
+        state: present
+        update_cache: true
+
+    - name: Check that /dev/net/tun exists
+      ansible.builtin.stat:
+        path: /dev/net/tun
+      register: tun_dev
+
+    - name: Fail early if TUN is unavailable
+      ansible.builtin.assert:
+        that: tun_dev.stat.exists
+        fail_msg: "/dev/net/tun is missing; the VPN cannot work on this image."
+
+    # sudo sysctl net.ipv4.ip_forward=1  (persisted so it survives reboots)
+    - name: Persist IP forwarding
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-seed-ip-forward.conf
+        content: "net.ipv4.ip_forward = 1\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable IP forwarding now
+      ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+      changed_when: false
+
+    - name: Find the real interface facing the network
+      ansible.builtin.shell: |
+        set -o pipefail
+        ip -o route get {{ blocked_target_ip }} | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1
+      args:
+        executable: /bin/bash
+      register: nat_iface
+      changed_when: false
+
+    - name: Fail if the NAT interface could not be detected
+      ansible.builtin.assert:
+        that: nat_iface.stdout | length > 0
+        fail_msg: "Could not determine the outgoing interface on vpn-server."
+
+    # Mirrors the lab: iptables -t nat -F, then
+    # iptables -t nat -A POSTROUTING -j MASQUERADE -o <iface>
+    - name: Flush the nat table
+      ansible.builtin.iptables:
+        table: nat
+        flush: true
+
+    - name: Masquerade everything leaving the real interface
+      ansible.builtin.iptables:
+        table: nat
+        chain: POSTROUTING
+        out_interface: "{{ nat_iface.stdout }}"
+        jump: MASQUERADE
+        comment: SEED VPN server NAT
+
+    - name: Make iptables rules persistent
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Save current iptables rules
+      ansible.builtin.command: netfilter-persistent save
+      changed_when: false
+
+    - name: Create VPN binary directory
+      ansible.builtin.file:
+        path: "{{ vpn_binary_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy vpnserver binary
+      ansible.builtin.copy:
+        src: files/vpnserver
+        dest: "{{ vpn_binary_dir }}/vpnserver"
+        owner: root
+        group: root
+        mode: "{{ vpn_binary_mode }}"
+
+# ------------------------------------------------------------ blocked-target
+- name: Configure the blocked target site
+  hosts: blocked-target
+  become: true
+  tasks:
+    - name: Install web server and tools
+      ansible.builtin.apt:
+        name:
+          - apache2
+          - netcat-openbsd
+          - tcpdump
+        state: present
+        update_cache: true
+
+    - name: Publish a recognisable landing page
+      ansible.builtin.copy:
+        dest: /var/www/html/index.html
+        content: |
+          <html><body>
+          <h1>Blocked target</h1>
+          <p>If you can read this from vpn-client, the firewall was bypassed.</p>
+          </body></html>
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Ensure Apache is running and enabled
+      ansible.builtin.service:
+        name: apache2
+        state: started
+        enabled: true
